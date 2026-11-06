@@ -101,12 +101,15 @@ namespace CrispyHarmonyPhotoImport
         private readonly Button pause = MakeButton("暂停", 92);
         private readonly Button open = MakeButton("打开保存位置", 132);
         private readonly Button details = MakeButton("详细信息", 96);
+        private readonly Label albumSize = MakeLabel("", false);
         private readonly Label state = MakeLabel("连接手机后，选择要导入的相册。", true);
         private readonly Label hint = MakeLabel("", false);
         private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Top, Height = 18, AccessibleName = "导入进度" };
         private readonly StringBuilder log = new StringBuilder();
         private bool busy, importing, updatingDevices, closeWhenDone, gotAlbums, finished, paused, empty;
-        private string pausePath, lastError, completedPath;
+        private string pausePath, lastError, completedPath, progressText;
+        private Task estimateTask = Task.FromResult(0);
+        private CancellationTokenSource estimateCancellation;
 
         internal ImportWindow(string payload, string appData, string hdcOverride = null)
         {
@@ -144,7 +147,7 @@ namespace CrispyHarmonyPhotoImport
             };
             AddRow(page, help);
             AddRow(page, MakeLabel("2  选择相册和保存位置", true));
-            AddRow(page, albums);
+            AddRow(page, Pair(albums, albumSize));
             AddRow(page, Pair(destination, browse));
             AddRow(page, state);
             AddRow(page, progress);
@@ -174,7 +177,7 @@ namespace CrispyHarmonyPhotoImport
                 albums.Items.Clear();
                 await ReadAlbumsAsync();
             };
-            albums.SelectedIndexChanged += delegate { RefreshControls(); };
+            albums.SelectedIndexChanged += delegate { UpdateAlbumSize(); RefreshControls(); };
             destination.TextChanged += delegate { RefreshControls(); };
             FormClosing += OnClosing;
             RefreshControls();
@@ -203,14 +206,14 @@ namespace CrispyHarmonyPhotoImport
             page.Controls.Add(control, 0, page.RowCount++);
         }
 
-        private static Control Pair(Control field, Button button)
+        private static Control Pair(Control field, Control companion)
         {
             var row = new TableLayoutPanel { ColumnCount = 2, RowCount = 1, AutoSize = true, Dock = DockStyle.Top, Margin = new Padding(0) };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             field.Margin = new Padding(0, 6, 8, 4);
             row.Controls.Add(field, 0, 0);
-            row.Controls.Add(button, 1, 0);
+            row.Controls.Add(companion, 1, 0);
             return row;
         }
 
@@ -286,7 +289,7 @@ namespace CrispyHarmonyPhotoImport
 
         internal async Task ReadAlbumsAsync()
         {
-            if (busy) return;
+            if (busy || closeWhenDone) return;
             gotAlbums = false;
             finished = false;
             var oldAlbum = albums.SelectedItem as Album;
@@ -294,6 +297,7 @@ namespace CrispyHarmonyPhotoImport
             state.Text = "正在检测手机…";
             hint.Text = "";
             await RunAsync("browse", oldAlbum, "");
+            if (gotAlbums) UpdateAlbumSize();
             if (!gotAlbums)
             {
                 var connected = devices.SelectedItem as Phone;
@@ -323,9 +327,94 @@ namespace CrispyHarmonyPhotoImport
 
         private bool gotDevices;
 
+        private void UpdateAlbumSize()
+        {
+            CancelEstimate();
+            var album = albums.SelectedItem as Album;
+            var phone = devices.SelectedItem as Phone;
+            if (album == null || phone == null) { albumSize.Text = ""; return; }
+            if (album.Size.HasValue) { ShowAlbumSize(album, album.Size.Value); return; }
+            albumSize.Text = "正在估算…";
+            if (busy || closeWhenDone) return;
+            estimateCancellation = new CancellationTokenSource();
+            estimateTask = EstimateAsync(estimateTask, phone, album, estimateCancellation);
+        }
+
+        private void CancelEstimate()
+        {
+            if (estimateCancellation != null) estimateCancellation.Cancel();
+        }
+
+        private async Task EstimateAsync(Task previous, Phone phone, Album album, CancellationTokenSource cancellation)
+        {
+            try
+            {
+                await previous;
+                cancellation.Token.ThrowIfCancellationRequested();
+                var bytes = await Task.Run(() => ReadAlbumSize(phone, album, cancellation.Token));
+                if (!cancellation.IsCancellationRequested) ShowAlbumSize(album, bytes);
+            }
+            catch (Exception error)
+            {
+                if (!cancellation.IsCancellationRequested)
+                {
+                    albumSize.Text = "暂无法估算大小";
+                    AppendLog("相册大小估算失败。" + error.Message);
+                }
+            }
+            finally
+            {
+                if (estimateCancellation == cancellation) estimateCancellation = null;
+                cancellation.Dispose();
+            }
+        }
+
+        private long ReadAlbumSize(Phone phone, Album album, CancellationToken cancellation)
+        {
+            string request = CreateRequest("estimate", phone, album, "");
+            try
+            {
+                long? bytes = null;
+                string error = null;
+                string output = null;
+                int code = RunBackend(request, data =>
+                {
+                    switch ((string)data["kind"])
+                    {
+                        case "albumSize": bytes = Convert.ToInt64(data["totalBytes"]); break;
+                        case "error": error = (string)data["message"]; break;
+                    }
+                }, line => { if (!String.IsNullOrWhiteSpace(line)) output = line.Trim(); }, cancellation);
+                if (code != 0 || !bytes.HasValue) throw new IOException(error ?? output ?? "未收到相册大小。退出代码 " + code);
+                return bytes.Value;
+            }
+            finally { TryDelete(request); }
+        }
+
+        private void ShowAlbumSize(Album album, long bytes)
+        {
+            album.Size = bytes;
+            albumSize.Text = "约 " + FormatSize(bytes);
+        }
+
+        private static readonly string[] SizeUnits = { "B", "KB", "MB", "GB", "TB", "PB", "EB" };
+
+        private static string FormatSize(long bytes)
+        {
+            decimal value = bytes;
+            int unit = 0;
+            while (value >= 1024 && unit < SizeUnits.Length - 1)
+            {
+                value /= 1024;
+                unit++;
+            }
+            return value.ToString("0.##") + " " + SizeUnits[unit];
+        }
+
         internal async Task StartImportAsync()
         {
-            if (busy || albums.SelectedItem == null) return;
+            var selected = albums.SelectedItem as Album;
+            if (busy || closeWhenDone || selected == null) return;
             string path;
             try
             {
@@ -349,10 +438,11 @@ namespace CrispyHarmonyPhotoImport
             completedPath = null;
             state.Text = "正在准备导入…";
             hint.Text = "保持手机连接。导入完成后可在这里打开保存位置。";
-            await RunAsync("import", (Album)albums.SelectedItem, path);
+            await RunAsync("import", selected, path);
+            if (!selected.Size.HasValue) albumSize.Text = "大小未估算";
             if (paused)
             {
-                state.Text = "导入已暂停";
+                ShowProgress("导入已暂停");
                 hint.Text = "保持原保存位置，再点“开始导入”即可继续。";
                 if (Directory.Exists(path)) completedPath = path;
             }
@@ -363,7 +453,7 @@ namespace CrispyHarmonyPhotoImport
             }
             else if (!finished)
             {
-                state.Text = "导入未完成";
+                ShowProgress("导入未完成");
                 hint.Text = FriendlyError(lastError);
                 if (Directory.Exists(path)) completedPath = path;
             }
@@ -387,21 +477,20 @@ namespace CrispyHarmonyPhotoImport
             lastError = null;
             var phone = devices.SelectedItem as Phone;
             string requestFile = null;
+            progressText = null;
             progress.Style = ProgressBarStyle.Marquee;
-            lock (log) log.Clear();
             RefreshControls();
             try
             {
-                var jobDir = Path.Combine(appData, "jobs");
-                Directory.CreateDirectory(jobDir);
-                requestFile = Path.Combine(jobDir, Guid.NewGuid().ToString("N") + ".json");
+                CancelEstimate();
+                await estimateTask;
+                if (closeWhenDone) return;
+                lock (log) log.Clear();
+                requestFile = CreateRequest(action, phone, selected, path);
                 pausePath = importing ? requestFile + ".pause" : null;
-                var request = new { action = action, device = phone == null ? "" : phone.Id,
-                    deviceKind = phone == null ? "" : phone.Kind, destination = path,
-                    album = selected == null ? "相机" : selected.Name, allAlbums = selected != null && selected.All };
-                File.WriteAllText(requestFile, new JavaScriptSerializer().Serialize(request), new UTF8Encoding(false));
                 RefreshControls();
-                int code = await Task.Run(() => RunBackend(requestFile, selected));
+                int code = await Task.Run(() => RunBackend(requestFile,
+                    data => BeginInvoke((Action)(() => HandleEvent(data, selected))), AppendLog, CancellationToken.None));
                 if (code != 0 && code != 2 && lastError == null) lastError = "导入进程退出，代码 " + code;
             }
             catch (Exception error)
@@ -415,13 +504,27 @@ namespace CrispyHarmonyPhotoImport
                 TryDelete(requestFile);
                 pausePath = null;
                 busy = importing = false;
-                if (!finished) { progress.Style = ProgressBarStyle.Blocks; progress.Value = 0; }
+                if (!finished && progressText == null) { progress.Style = ProgressBarStyle.Blocks; progress.Value = 0; }
                 RefreshControls();
                 if (closeWhenDone) BeginInvoke((Action)Close);
             }
         }
 
-        private int RunBackend(string request, Album selected)
+        private string CreateRequest(string action, Phone phone, Album selected, string path)
+        {
+            var jobDir = Path.Combine(appData, "jobs");
+            Directory.CreateDirectory(jobDir);
+            var requestFile = Path.Combine(jobDir, Guid.NewGuid().ToString("N") + ".json");
+            var request = new { action = action, device = phone == null ? "" : phone.Id,
+                deviceKind = phone == null ? "" : phone.Kind, destination = path,
+                album = selected == null ? "相机" : selected.Name, allAlbums = selected != null && selected.All };
+            try { File.WriteAllText(requestFile, new JavaScriptSerializer().Serialize(request), new UTF8Encoding(false)); }
+            catch { TryDelete(requestFile); throw; }
+            return requestFile;
+        }
+
+        private int RunBackend(string request, Action<Dictionary<string, object>> onEvent, Action<string> onLog,
+            CancellationToken cancellation)
         {
             var arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(Path.Combine(payload, "Import-HarmonyPhotos.ps1"))
                 + " -GuiRequest " + Quote(request);
@@ -432,7 +535,15 @@ namespace CrispyHarmonyPhotoImport
                 UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
                 StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, WorkingDirectory = payload
             };
+            cancellation.ThrowIfCancellationRequested();
             using (var process = Process.Start(info))
+            using (cancellation.Register(() =>
+            {
+                // Estimate jobs only read the phone, so a change of selection can interrupt them.
+                try { process.Kill(); }
+                catch (InvalidOperationException) { }
+                catch (System.ComponentModel.Win32Exception) { }
+            }))
             {
                 var error = process.StandardError.ReadToEndAsync();
                 var serializer = new JavaScriptSerializer();
@@ -445,14 +556,14 @@ namespace CrispyHarmonyPhotoImport
                         try
                         {
                             var data = serializer.Deserialize<Dictionary<string, object>>(line.Substring(prefix.Length));
-                            BeginInvoke((Action)(() => HandleEvent(data, selected)));
+                            onEvent(data);
                         }
-                        catch (ArgumentException) { AppendLog(line); }
+                        catch (ArgumentException) { onLog(line); }
                     }
-                    else AppendLog(line);
+                    else onLog(line);
                 }
                 process.WaitForExit();
-                AppendLog(error.GetAwaiter().GetResult());
+                onLog(error.GetAwaiter().GetResult());
                 return process.ExitCode;
             }
         }
@@ -508,25 +619,36 @@ namespace CrispyHarmonyPhotoImport
                 case "phase":
                     if (pause.Enabled) state.Text = (string)data["message"];
                     break;
+                case "albumSize":
+                    ShowAlbumSize(selected, Convert.ToInt64(data["totalBytes"]));
+                    break;
                 case "progress":
                     var done = Convert.ToInt32(data["done"]);
                     var total = Convert.ToInt32(data["total"]);
+                    var doneBytes = Convert.ToInt64(data["doneBytes"]);
+                    var totalBytes = Convert.ToInt64(data["totalBytes"]);
+                    progressText = String.Format("{0} / {1} · {2} / {3} 个文件", FormatSize(doneBytes), FormatSize(totalBytes), done, total);
                     progress.Style = ProgressBarStyle.Blocks;
-                    progress.Value = total > 0 ? (int)(100.0 * done / total) : 0;
-                    if (pause.Enabled) state.Text = String.Format("正在导入 · 已完成 {0} / {1}", done, total);
+                    progress.Value = totalBytes > 0 ? (int)(100m * doneBytes / totalBytes) : 0;
+                    ShowProgress(pause.Enabled ? "正在导入" : "正在暂停…");
                     break;
                 case "complete":
                     finished = true;
                     completedPath = (string)data["destination"];
                     progress.Style = ProgressBarStyle.Blocks;
                     progress.Value = 100;
-                    state.Text = "导入完成";
+                    ShowProgress("导入完成");
                     hint.Text = String.Format("新复制 {0} 个文件，已核验 {1} 个已有文件。", data["copied"], data["skipped"]);
                     break;
                 case "empty": empty = true; break;
                 case "paused": paused = true; break;
                 case "error": lastError = (string)data["message"]; AppendLog(lastError); break;
             }
+        }
+
+        private void ShowProgress(string status)
+        {
+            state.Text = progressText == null ? status : status + " · " + progressText;
         }
 
         private void RequestPause()
@@ -536,15 +658,25 @@ namespace CrispyHarmonyPhotoImport
             {
                 File.WriteAllText(pausePath, "pause");
                 pause.Enabled = false;
-                state.Text = "正在暂停…";
+                ShowProgress("正在暂停…");
                 hint.Text = "当前文件处理完后就会暂停。";
             }
             catch (Exception error) { MessageBox.Show(this, error.Message, "无法请求暂停"); }
         }
 
-        private void OnClosing(object sender, FormClosingEventArgs e)
+        private async void OnClosing(object sender, FormClosingEventArgs e)
         {
-            if (!busy) return;
+            if (!busy)
+            {
+                if (estimateTask.IsCompleted) return;
+                e.Cancel = true;
+                if (closeWhenDone) return;
+                closeWhenDone = true;
+                CancelEstimate();
+                await estimateTask;
+                Close();
+                return;
+            }
             e.Cancel = true;
             if (!importing || MessageBox.Show(this, "当前文件处理完后暂停并关闭窗口？", "关闭导入工具", MessageBoxButtons.YesNo) == DialogResult.Yes)
             {
@@ -585,6 +717,7 @@ namespace CrispyHarmonyPhotoImport
         {
             internal string Name;
             internal bool All;
+            internal long? Size;
             public override string ToString() { return Name; }
         }
     }

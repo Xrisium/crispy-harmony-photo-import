@@ -55,6 +55,13 @@ class ImportTests(unittest.TestCase):
     def summary(self):
         return json.loads((self.dest / '.harmony-import/summary.json').read_text(encoding='utf-8-sig'))
 
+    def run_gui(self, data, *args, **kwargs):
+        request = self.work / 'request.json'
+        request.write_text(json.dumps(data), encoding='utf-8')
+        output = self.run_import(*args, '-GuiRequest', str(request), **kwargs)
+        return [json.loads(line.removeprefix('HARMONY_GUI ')) for line in output.splitlines()
+                if line.startswith('HARMONY_GUI ')]
+
     def test_copy_resume_and_repair_same_size_corruption(self):
         self.run_import()
         self.assertEqual(self.summary()['copied'], 2)
@@ -87,6 +94,42 @@ class ImportTests(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.run_import('-DryRun')
         self.assertFalse(self.dest.exists())
+
+    def test_album_size_estimates_selected_and_all_without_copying(self):
+        self.config['albums'].append('空相册')
+        self.config['directories'] = [{'parent': '/mnt/data/100/media_fuse/Photo/相机', 'name': '子目录'}]
+        self.add_file('相机/子目录', 'nested.jpg', b'nested')
+        self.config['files'][2]['size'] = 2 * 1024 ** 4
+        camera_bytes = sum(f['size'] for f in self.config['files'] if '/相机/' in f['remote'])
+        request = dict(action='estimate', device='TEST-USB', deviceKind='Hdc',
+                       destination=str(self.dest), album='相机', allAlbums=False)
+        for album, all_albums, expected in [('相机', False, camera_bytes), ('空相册', False, 0),
+                                            ('', True, camera_bytes + 2 * 1024 ** 4)]:
+            with self.subTest(album=album, all_albums=all_albums):
+                request.update(album=album, allAlbums=all_albums)
+                events = self.run_gui(request)
+                self.assertEqual([e['totalBytes'] for e in events if e['kind'] == 'albumSize'], [expected])
+        request.update(deviceKind='Mtp', allAlbums=True)
+        events = self.run_gui(request, '-MtpAssembly', str(self.mtp))
+        self.assertEqual([e['totalBytes'] for e in events if e['kind'] == 'albumSize'], [12])
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.calls.exists())
+
+    def test_progress_counts_verified_bytes_after_each_file_and_on_resume(self):
+        first, second = (file['size'] for file in self.config['files'][:2])
+        total = first + second
+        request = dict(action='import', device='TEST-USB', deviceKind='Hdc',
+                       destination=str(self.dest), album='相机', allAlbums=False)
+
+        def progress(**kwargs):
+            return [(e['doneBytes'], e['totalBytes'], e['done'], e['total']) for e in self.run_gui(request, **kwargs)
+                    if e['kind'] == 'progress']
+
+        self.config['mode'] = 'midfail'
+        self.assertEqual(progress(ok=False), [(0, total, 0, 2), (first, total, 1, 2)])
+        self.config['mode'] = ''
+        self.assertEqual(progress(), [(first, total, 1, 2), (total, total, 2, 2)])
+        self.assertEqual(progress(), [(total, total, 2, 2)])
 
     def test_no_device_or_authorization(self):
         self.config['targets'] = []
@@ -177,14 +220,10 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((self.dest / 'SD 卡/Pictures/截图.png').read_bytes(), b'png!')
 
     def test_mixed_device_gui_selection_and_missing_phone(self):
-        request = self.work / 'request.json'
-        args = ('-MtpAssembly', str(self.mtp), '-GuiRequest', str(request))
         data = dict(action='browse', device='', deviceKind='', destination=str(self.dest), album='', allAlbums=True)
 
         def run_gui(**kwargs):
-            request.write_text(json.dumps(data), encoding='utf-8')
-            return [json.loads(line.removeprefix('HARMONY_GUI ')) for line in self.run_import(*args, **kwargs).splitlines()
-                    if line.startswith('HARMONY_GUI ')]
+            return self.run_gui(data, '-MtpAssembly', str(self.mtp), **kwargs)
 
         devices, _ = run_gui(ok=False)
         self.assertEqual({item['Kind'] for item in devices['items']}, {'Hdc', 'Mtp'})

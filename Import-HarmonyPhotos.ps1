@@ -23,6 +23,7 @@ $script:LogWriter = $null
 $script:Serial = ''
 $script:PauseFile = ''
 $mtp = $null
+$estimate = $false
 
 function Write-GuiEvent([string]$Kind, [hashtable]$Data) {
     if ($GuiRequest) {
@@ -234,7 +235,8 @@ try {
         $request = Get-Content -LiteralPath $GuiRequest -Raw -Encoding UTF8 | ConvertFrom-Json
         $NonInteractive = $true
         $ListAlbums = $request.action -eq 'browse'
-        if (-not $ListAlbums -and $request.action -ne 'import') { throw '未知的窗口请求。' }
+        $estimate = $request.action -eq 'estimate'
+        if (-not $ListAlbums -and -not $estimate -and $request.action -ne 'import') { throw '未知的窗口请求。' }
         $Device = $request.device
         if ($request.PSObject.Properties['deviceKind'] -and $request.deviceKind) { $DeviceKind = $request.deviceKind }
         $Destination = $request.destination
@@ -334,6 +336,8 @@ try {
     }
     [long]$total = 0
     foreach ($file in $files) { $total += $file.Size }
+    Write-GuiEvent 'albumSize' @{ totalBytes = $total }
+    if ($estimate) { exit 0 }
     Write-Host ("本地可见文件：{0} 个，合计 {1:N2} GiB。" -f $files.Count, ($total / 1GB))
     Write-Host '云端独有、隐藏相册及回收站内容不包含在本次列表中。'
     if (-not $Destination) {
@@ -394,6 +398,7 @@ try {
     }
     $pending = New-Object 'System.Collections.Generic.List[object]'
     $skipped = 0
+    [long]$doneBytes = 0
     Write-GuiEvent 'phase' @{ message = '正在检查磁盘空间和已导入的文件…' }
     foreach ($file in $files) {
         Test-ImportPause
@@ -407,6 +412,7 @@ try {
             if (-not $item.PSIsContainer -and $item.Length -eq $file.Size -and $receipt.size -eq $file.Size -and
                 $file.Modified -and $receipt.modified -eq $file.Modified -and (Get-LocalHash $target) -eq $receipt.sha256) {
                 $skipped++
+                $doneBytes += $file.Size
                 continue
             }
         }
@@ -426,11 +432,13 @@ try {
     Write-Event ("已核验并跳过 {0} 个文件；待导入 {1} 个。" -f $skipped, $pending.Count)
     $partial = Join-Path $stateDir 'current.partial'
     $copied = 0
+    $progress = @{ done = $skipped; total = $files.Count; doneBytes = $doneBytes; totalBytes = $total }
+    Write-GuiEvent 'progress' $progress
     foreach ($file in $pending) {
         Test-ImportPause
-        Write-GuiEvent 'progress' @{ done = ($copied + $skipped); total = $files.Count; file = $file.Relative }
         $index = $copied + 1
-        Write-Progress -Activity '正在导入照片和视频' -Status "$index / $($pending.Count)  $($file.Relative)" -PercentComplete (100 * $copied / $pending.Count)
+        $percent = if ($total -gt 0) { [Math]::Floor([decimal]100 * $doneBytes / $total) } else { 0 }
+        Write-Progress -Activity '正在导入照片和视频' -Status "$doneBytes / $total 字节 · $($progress.done) / $($files.Count) 个文件 · $($file.Relative)" -PercentComplete $percent
         Write-Event ("[{0}/{1}] {2}" -f $index, $pending.Count, $file.Relative)
         if (Test-Path -LiteralPath $partial) { [IO.File]::Delete($partial) }
         if ($mtp) { $mtp.CopyFile($file.ObjectId, $partial) }
@@ -454,6 +462,10 @@ try {
         if ($replaceExisting) { [IO.File]::Replace($partial, $target, [NullString]::Value) }
         else { [IO.File]::Move($partial, $target) }
         $copied++
+        $doneBytes += $file.Size
+        $progress.done = $copied + $skipped
+        $progress.doneBytes = $doneBytes
+        Write-GuiEvent 'progress' $progress
     }
     Write-Progress -Activity '正在导入照片和视频' -Completed
     $summary = @{ schema = 1; status = 'complete'; device = $script:Serial; completedAt = (Get-Date).ToString('o'); totalFiles = $files.Count; totalBytes = $total; copied = $copied; verifiedSkipped = $skipped; verification = 'remote listing size + local SHA256; not remote SHA256 verification' }
