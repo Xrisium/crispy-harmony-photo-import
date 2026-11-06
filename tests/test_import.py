@@ -2,8 +2,8 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,13 +11,19 @@ PS = Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershel
 
 
 class ImportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        work = tempfile.TemporaryDirectory(prefix='crispy-photo-assembly-')
+        cls.addClassCleanup(work.cleanup)
+        cls.mtp = Path(work.name) / 'fake-mtp.dll'
+        compiler = Path(os.environ['SystemRoot']) / 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+        subprocess.run([str(compiler), '/nologo', '/target:library', '/platform:x64', '/codepage:65001',
+                        f'/out:{cls.mtp}', str(ROOT / 'tests/fake-mtp.cs')], check=True, timeout=30)
+
     def setUp(self):
-        self.work = ROOT / '.test-work' / self.id().split('.')[-1]
-        if not self.work.resolve().is_relative_to(ROOT / '.test-work'):
-            raise ValueError(f'Unexpected test path: {self.work}')
-        if self.work.exists():
-            shutil.rmtree(self.work)
-        self.work.mkdir(parents=True)
+        work = tempfile.TemporaryDirectory(prefix='crispy-photo-import-')
+        self.addCleanup(work.cleanup)
+        self.work = Path(work.name)
         self.dest = self.work / '导出 空格'
         self.config_path = self.work / 'device.json'
         self.calls = self.work / 'transfers.txt'
@@ -33,10 +39,11 @@ class ImportTests(unittest.TestCase):
         self.config['files'].append({'remote': f'/mnt/data/100/media_fuse/Photo/{album}/{name}',
                                      'size': len(content), 'source': str(source)})
 
-    def run_import(self, *args, ok=True):
+    def run_import(self, *args, ok=True, mtp_mode='', mtp_session='first'):
         self.config_path.write_text(json.dumps(self.config, ensure_ascii=False), encoding='utf-8')
         env = {**os.environ, 'HARMONY_TEST_CONFIG': str(self.config_path),
-               'HARMONY_TEST_TRANSFERS': str(self.calls)}
+               'HARMONY_TEST_TRANSFERS': str(self.calls), 'MTP_TEST_MODE': mtp_mode,
+               'MTP_TEST_SESSION': mtp_session}
         result = subprocess.run([str(PS), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
                                  str(ROOT / 'Import-HarmonyPhotos.ps1'), '-Destination', str(self.dest),
                                  '-NonInteractive', '-HdcPath', str(ROOT / 'tests/fake-hdc.ps1'), *args],
@@ -150,6 +157,56 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(self.summary()['verifiedSkipped'], 1)
         self.run_import()
         self.assertEqual(self.summary()['verifiedSkipped'], 2)
+
+    def test_mtp_auto_detect_and_resume_with_changed_object_ids(self):
+        self.config['targets'] = []
+        args = ('-MtpAssembly', str(self.mtp))
+        self.run_import(*args, mtp_mode='disconnect', ok=False)
+        self.assertFalse((self.dest / '.harmony-import/summary.json').exists())
+        self.assertEqual((self.dest / "内部存储/DCIM/Camera/照片 O'Brien.jpg").read_bytes(), b'jpeg')
+        self.run_import(*args, mtp_mode='short', mtp_session='second', ok=False)
+        self.assertFalse((self.dest / '内部存储/DCIM/Camera/视频.mp4').exists())
+        self.run_import(*args, mtp_session='third')
+        self.assertEqual(self.summary()['verifiedSkipped'], 1)
+        self.assertEqual(self.summary()['copied'], 1)
+        self.assertEqual((self.dest / '内部存储/DCIM/Camera/视频.mp4').read_bytes(), b'mp4!')
+        self.assertFalse((self.dest / 'SD 卡').exists())
+        self.run_import(*args, '-AllAlbums', mtp_mode='undated')
+        self.assertEqual(self.summary()['verifiedSkipped'], 1)
+        self.assertEqual(self.summary()['copied'], 2)
+        self.assertEqual((self.dest / 'SD 卡/Pictures/截图.png').read_bytes(), b'png!')
+
+    def test_mixed_device_gui_selection_and_missing_phone(self):
+        request = self.work / 'request.json'
+        args = ('-MtpAssembly', str(self.mtp), '-GuiRequest', str(request))
+        data = dict(action='browse', device='', deviceKind='', destination=str(self.dest), album='', allAlbums=True)
+
+        def run_gui(**kwargs):
+            request.write_text(json.dumps(data), encoding='utf-8')
+            return [json.loads(line.removeprefix('HARMONY_GUI ')) for line in self.run_import(*args, **kwargs).splitlines()
+                    if line.startswith('HARMONY_GUI ')]
+
+        devices, _ = run_gui(ok=False)
+        self.assertEqual({item['Kind'] for item in devices['items']}, {'Hdc', 'Mtp'})
+        self.assertIsNone(devices['selected'])
+        data.update(device='TEST-USB', deviceKind='Mtp')
+        devices, albums = run_gui()
+        self.assertEqual(devices['selected']['Kind'], 'Mtp')
+        self.assertEqual(albums['defaultAlbum'], 'DCIM（内部存储）')
+        data['action'] = 'import'
+        run_gui(mtp_mode='absent', ok=False)
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.calls.exists())
+        run_gui()
+        self.assertEqual(self.summary()['totalFiles'], 3)
+        data['deviceKind'] = 'Hdc'
+        run_gui(ok=False)
+        self.assertFalse(self.calls.exists())
+        data['action'] = 'browse'
+        data['deviceKind'] = 'Mtp'
+        devices, albums = run_gui(mtp_mode='absent')
+        self.assertEqual(devices['selected']['Kind'], 'Hdc')
+        self.assertEqual(albums['defaultAlbum'], '相机')
 
 
 if __name__ == '__main__':

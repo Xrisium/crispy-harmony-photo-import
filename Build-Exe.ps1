@@ -16,7 +16,7 @@ try {
     $references = @('System.IO.Compression.dll', 'System.Web.Extensions.dll') | ForEach-Object { '/reference:' + (Join-Path $framework $_) }
     & $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 @references `
         "/win32manifest:$root\gui\app.manifest" "/resource:$payload,crispy-harmony-photo-import.payload.zip" `
-        "/out:$output" "$root\gui\CrispyHarmonyPhotoImport.cs"
+        "/out:$output" "$root\gui\CrispyHarmonyPhotoImport.cs" "$root\gui\MtpDevice.cs" "$root\gui\PortableDeviceInterop.cs"
     if ($LASTEXITCODE -ne 0) { throw "Windows executable build failed: $LASTEXITCODE" }
     $hash = (Get-FileHash -LiteralPath $output -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText(($output + '.sha256'), ($hash + '  ' + [IO.Path]::GetFileName($output) + "`n"))

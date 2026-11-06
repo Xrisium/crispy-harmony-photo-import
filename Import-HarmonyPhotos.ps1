@@ -2,12 +2,14 @@
 param(
     [string]$Destination,
     [string]$Device,
+    [ValidateSet('Hdc', 'Mtp')][string]$DeviceKind,
     [string[]]$Album = @('相机'),
     [switch]$AllAlbums,
     [switch]$ListAlbums,
     [switch]$DryRun,
     [switch]$NonInteractive,
     [string]$HdcPath,
+    [string]$MtpAssembly,
     [string]$GuiRequest
 )
 
@@ -20,6 +22,7 @@ $script:Lock = $null
 $script:LogWriter = $null
 $script:Serial = ''
 $script:PauseFile = ''
+$mtp = $null
 
 function Write-GuiEvent([string]$Kind, [hashtable]$Data) {
     if ($GuiRequest) {
@@ -132,37 +135,88 @@ function Get-AlbumFiles([string]$Remote, [string]$Relative) {
     }
 }
 
+function Get-HdcTargets {
+    if ($HdcPath) {
+        $script:Hdc = (Resolve-Path -LiteralPath $HdcPath).Path
+    } else {
+        $toolDir = Join-Path $PSScriptRoot 'tools\hdc'
+        $provenance = Get-Content -LiteralPath (Join-Path $toolDir 'provenance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($file in $provenance.files) {
+            if ((Get-LocalHash (Join-Path $toolDir $file.name)) -ne $file.sha256) { throw "随包工具校验失败：$($file.name)。请重新获取完整的 EXE。" }
+        }
+        $script:Hdc = Join-Path $toolDir 'hdc.exe'
+    }
+    $output = Invoke-Hdc -CommandArgs @('list', 'targets', '-v')
+    foreach ($line in ($output -split '\r?\n')) {
+        if ($line -match '^(?<id>\S+)\s+(?<transport>USB|TCP)\s+(?<state>\S+)') {
+            [pscustomobject]@{ Id = $Matches.id; Name = $Matches.id; State = $Matches.state; Kind = 'Hdc' }
+        }
+    }
+}
+
+function Get-MtpAlbumFiles([string]$Id, [string]$Remote, [string]$Relative) {
+    Test-ImportPause
+    foreach ($entry in $mtp.GetEntries($Id)) {
+        Test-ImportPause
+        Assert-SafeName $entry.Name
+        $remotePath = $Remote + '/' + $entry.Name
+        $relativePath = Join-Path $Relative $entry.Name
+        if ($entry.IsFolder) {
+            Get-MtpAlbumFiles $entry.Id $remotePath $relativePath
+        } else {
+            [pscustomobject]@{ Remote = $remotePath; Relative = $relativePath; Size = $entry.Size; Modified = $entry.Modified; ObjectId = $entry.Id }
+        }
+    }
+}
+
 function Select-Phone {
     while ($true) {
-        $output = Invoke-Hdc -CommandArgs @('list', 'targets', '-v')
-        $targets = @(
-            foreach ($line in ($output -split '\r?\n')) {
-                if ($line -match '^(?<id>\S+)\s+(?<transport>USB|TCP)\s+(?<state>\S+)') {
-                    [pscustomobject]@{ Id = $Matches.id; State = $Matches.state; Transport = $Matches.transport }
-                }
+        $errors = @()
+        $allTargets = @(
+            if ($DeviceKind -ne 'Mtp' -or ($GuiRequest -and $ListAlbums)) {
+                try { Get-HdcTargets }
+                catch { $errors += "鸿蒙检测失败。$_" }
+            }
+            if ($MtpAssembly -and ($DeviceKind -ne 'Hdc' -or ($GuiRequest -and $ListAlbums))) {
+                try {
+                    # The user already launched the EXE. Loading bytes also works from a USB drive or UNC path.
+                    [void][Reflection.Assembly]::Load([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $MtpAssembly).Path))
+                    foreach ($phone in [CrispyHarmonyPhotoImport.MtpDevice]::ListPhones()) {
+                        [pscustomobject]@{ Id = $phone.Id; Name = $phone.Name; State = 'Connected'; Kind = 'Mtp' }
+                    }
+                } catch { $errors += "USB 文件传输检测失败。$_" }
             }
         )
-        Write-GuiEvent 'devices' @{ items = $targets }
-        if ($Device) { $targets = @($targets | Where-Object { $_.Id -eq $Device }) }
-        if ($targets.Count -eq 1 -and $targets[0].State -eq 'Connected') { return $targets[0].Id }
+        foreach ($message in $errors) { Write-Host $message }
+        $targets = @($allTargets | Where-Object { (!$Device -or $_.Id -eq $Device) -and (!$DeviceKind -or $_.Kind -eq $DeviceKind) })
+        # Refresh can follow a reconnect or a change of phones. An import stays bound to its selection.
+        if (!$targets.Count -and $GuiRequest -and $ListAlbums) { $targets = $allTargets; $Device = '' }
+        $ready = @($targets | Where-Object { $_.State -eq 'Connected' })
+        $selected = $null
+        if ($targets.Count -eq 1) { $selected = $targets[0] }
+        elseif (!$Device -and $ready.Count -eq 1) { $selected = $ready[0] }
+        Write-GuiEvent 'devices' @{ items = $allTargets; selected = $selected }
+        if ($selected -and $selected.State -eq 'Connected') { return $selected }
         if ($targets.Count -gt 1) {
             if ($NonInteractive) { throw '发现多台设备，请用 -Device 指定设备标识符。' }
             Write-Host '发现多台设备：'
-            for ($i = 0; $i -lt $targets.Count; $i++) { Write-Host ("{0}. {1} ({2})" -f ($i + 1), $targets[$i].Id, $targets[$i].State) }
+            for ($i = 0; $i -lt $targets.Count; $i++) { Write-Host ("{0}. {1} ({2}, {3})" -f ($i + 1), $targets[$i].Name, $targets[$i].Kind, $targets[$i].State) }
             $choice = Read-Host '输入手机对应的序号'
             $number = 0
             if ([int]::TryParse($choice, [ref]$number) -and $number -ge 1 -and $number -le $targets.Count) {
                 $Device = $targets[$number - 1].Id
+                $DeviceKind = $targets[$number - 1].Kind
             }
             continue
         }
         Write-Host ''
-        Write-Host '请用支持数据传输的数据线直连电脑，解锁手机并开启 USB 调试。'
-        Write-Host '手机：设置中搜索[软件版本] → 连点七次 → 按提示重启。'
-        Write-Host '然后：设置 → 系统 → 开发者选项 → USB 调试，并允许这台电脑。'
+        Write-Host '请用支持数据传输的数据线直连电脑，并解锁手机。'
+        Write-Host '安卓手机在 USB 通知中选择「文件传输」。鸿蒙手机开启 USB 调试，并允许这台电脑。'
         if ($targets.Count) { Write-Host ("当前设备状态：" + $targets[0].State) }
-        if ($NonInteractive) { throw '手机尚未连接或授权。完成手机端操作后重新运行。' }
-        Write-Host '若一直没有设备，请换数据线/USB 接口，并检查设备管理器的 HDC 接口。'
+        if ($NonInteractive) {
+            if ($errors.Count -and !$allTargets.Count) { throw ($errors -join '；') }
+            throw '选定的手机尚未连接或授权。请检查手机端设置后重新检测。'
+        }
         $answer = Read-Host '完成后按回车重新检测；输入 Q 退出'
         if ($answer -eq 'q') { throw '已取消。' }
     }
@@ -182,6 +236,7 @@ try {
         $ListAlbums = $request.action -eq 'browse'
         if (-not $ListAlbums -and $request.action -ne 'import') { throw '未知的窗口请求。' }
         $Device = $request.device
+        if ($request.PSObject.Properties['deviceKind'] -and $request.deviceKind) { $DeviceKind = $request.deviceKind }
         $Destination = $request.destination
         $Album = @($request.album)
         $AllAlbums = $request.allAlbums
@@ -192,38 +247,53 @@ try {
     }
     Write-Host 'crispy-harmony-photo-import'
     Write-Host '将手机本地相册复制到电脑；保留手机原件。'
-    if ($HdcPath) {
-        $script:Hdc = (Resolve-Path -LiteralPath $HdcPath).Path
-    } else {
-        $toolDir = Join-Path $PSScriptRoot 'tools\hdc'
-        $provenance = Get-Content -LiteralPath (Join-Path $toolDir 'provenance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($file in $provenance.files) {
-            if ((Get-LocalHash (Join-Path $toolDir $file.name)) -ne $file.sha256) { throw "随包工具校验失败：$($file.name)。请重新获取完整的 EXE。" }
-        }
-        $script:Hdc = Join-Path $toolDir 'hdc.exe'
+    if (!$MtpAssembly -and !$HdcPath) {
+        $builtExe = Join-Path $PSScriptRoot 'dist\crispy-harmony-photo-import-win-x64.exe'
+        if (Test-Path -LiteralPath $builtExe -PathType Leaf) { $MtpAssembly = $builtExe }
     }
-    $version = (Invoke-Hdc -CommandArgs @('-v')).Trim()
-    Write-Host "HDC：$version"
-    $script:Serial = Select-Phone
-    Write-Host "已连接：$script:Serial"
-    # API 21+ media FUSE is the read interface exposed by HarmonyOS 6.
-    $mediaRoot = '/mnt/data/100/media_fuse/Photo'
-    try { $albums = @(Get-RemoteEntries $mediaRoot | Where-Object { $_.Kind -eq 'd' }) }
-    catch { throw "当前系统未提供可读的相册接口，无法用此工具直接导入。请确认 HarmonyOS 6、USB 调试和授权状态。详细信息：$_" }
+    $phone = Select-Phone
+    if ($phone.Kind -eq 'Mtp') {
+        $script:Serial = 'MTP:' + $phone.Id
+        Write-Host "已连接 USB 文件传输设备：$($phone.Name)"
+        try {
+            $mtp = [CrispyHarmonyPhotoImport.MtpDevice]::new($phone.Id)
+            $albums = @(
+                foreach ($folder in $mtp.GetAlbums()) {
+                    Assert-SafeName $folder.Storage
+                    Assert-SafeName $folder.Folder
+                    if ($folder.Storage -eq '.harmony-import') { throw '存储名称与导入记录目录冲突：.harmony-import' }
+                    [pscustomobject]@{
+                        Id = $folder.Id; Name = "$($folder.Folder)（$($folder.Storage)）"; Camera = $folder.Folder -eq 'DCIM'
+                        Remote = '/' + $folder.Storage + '/' + $folder.Folder
+                        Relative = Join-Path $folder.Storage $folder.Folder
+                    }
+                }
+            )
+            if (@($albums | Group-Object Name | Where-Object { $_.Count -gt 1 }).Count) { throw '手机上有重名相册。' }
+        } catch { throw "无法读取 USB 相册。请解锁手机，并在 USB 通知中选择「文件传输」。$_" }
+    } else {
+        $script:Serial = $phone.Id
+        Write-Host "已连接鸿蒙手机：$script:Serial"
+        # API 21+ media FUSE is the read interface exposed by HarmonyOS 6.
+        $mediaRoot = '/mnt/data/100/media_fuse/Photo'
+        try { $albums = @(Get-RemoteEntries $mediaRoot | Where-Object { $_.Kind -eq 'd' }) }
+        catch { throw "当前系统未提供可读的相册接口，无法用此工具直接导入。请确认 HarmonyOS 6、USB 调试和授权状态。详细信息：$_" }
+    }
+    $camera = if ($mtp) { $albums | Where-Object Camera | Select-Object -First 1 }
+        else { $albums | Where-Object { $_.Name -eq '相机' } | Select-Object -First 1 }
+    $defaultAlbum = if ($camera) { $camera.Name } elseif ($albums.Count) { $albums[0].Name } else { $null }
     if ($ListAlbums) {
-        Write-GuiEvent 'albums' @{ device = $script:Serial; items = @($albums | ForEach-Object { $_.Name }) }
+        Write-GuiEvent 'albums' @{ defaultAlbum = $defaultAlbum; items = @($albums | ForEach-Object { $_.Name }) }
         $albums | ForEach-Object { Write-Host $_.Name }
         exit 0
     }
     if (-not $NonInteractive -and -not $DryRun -and -not $AllAlbums -and
         -not $PSBoundParameters.ContainsKey('Album') -and $albums.Count) {
-        $defaultAlbum = @($albums | Where-Object { $_.Name -eq '相机' } | Select-Object -First 1)
-        if (-not $defaultAlbum.Count) { $defaultAlbum = @($albums[0]) }
         Write-Host '手机上的相册：'
         for ($i = 0; $i -lt $albums.Count; $i++) { Write-Host ("{0}. {1}" -f ($i + 1), $albums[$i].Name) }
         while ($true) {
-            $choice = (Read-Host "回车选择 [$($defaultAlbum[0].Name)]，输入序号选择相册，A 选择全部，Q 退出").Trim()
-            if (-not $choice) { $Album = @($defaultAlbum[0].Name); break }
+            $choice = (Read-Host "回车选择 [$defaultAlbum]，输入序号选择相册，A 选择全部，Q 退出").Trim()
+            if (-not $choice) { $Album = @($defaultAlbum); break }
             if ($choice -eq 'q') { throw '已取消。' }
             if ($choice -eq 'a') { $AllAlbums = $true; break }
             $number = 0
@@ -233,6 +303,9 @@ try {
             }
             Write-Host '请输入列表中的相册序号。'
         }
+    }
+    if ($mtp -and !$GuiRequest -and !$PSBoundParameters.ContainsKey('Album') -and ($NonInteractive -or $DryRun)) {
+        $Album = if ($defaultAlbum) { @($defaultAlbum) } else { @() }
     }
     if ($AllAlbums) { $selected = @($albums) }
     else {
@@ -248,7 +321,8 @@ try {
             Test-ImportPause
             Write-Host "正在读取相册：$($a.Name)（大型相册可能需要一些时间）"
             Write-GuiEvent 'phase' @{ message = "正在读取相册 $($a.Name)…" }
-            Get-AlbumFiles $a.Remote $a.Name
+            if ($mtp) { Get-MtpAlbumFiles $a.Id $a.Remote $a.Relative }
+            else { Get-AlbumFiles $a.Remote $a.Name }
         }
     )
     Test-ImportPause
@@ -331,7 +405,7 @@ try {
             }
             $item = Get-Item -LiteralPath $target
             if (-not $item.PSIsContainer -and $item.Length -eq $file.Size -and $receipt.size -eq $file.Size -and
-                $receipt.modified -eq $file.Modified -and (Get-LocalHash $target) -eq $receipt.sha256) {
+                $file.Modified -and $receipt.modified -eq $file.Modified -and (Get-LocalHash $target) -eq $receipt.sha256) {
                 $skipped++
                 continue
             }
@@ -359,8 +433,12 @@ try {
         Write-Progress -Activity '正在导入照片和视频' -Status "$index / $($pending.Count)  $($file.Relative)" -PercentComplete (100 * $copied / $pending.Count)
         Write-Event ("[{0}/{1}] {2}" -f $index, $pending.Count, $file.Relative)
         if (Test-Path -LiteralPath $partial) { [IO.File]::Delete($partial) }
-        $output = Invoke-Hdc -CommandArgs @('-t', $script:Serial, 'file', 'recv', $file.Remote, $partial)
-        if ($output -notmatch 'FileTransfer finish' -or -not (Test-Path -LiteralPath $partial)) { throw "未确认传输成功：$($file.Relative)。$output" }
+        if ($mtp) { $mtp.CopyFile($file.ObjectId, $partial) }
+        else {
+            $output = Invoke-Hdc -CommandArgs @('-t', $script:Serial, 'file', 'recv', $file.Remote, $partial)
+            if ($output -notmatch 'FileTransfer finish') { throw "未确认传输成功：$($file.Relative)。$output" }
+        }
+        if (-not [IO.File]::Exists($partial)) { throw "未确认传输成功：$($file.Relative)。" }
         if ((Get-Item -LiteralPath $partial).Length -ne $file.Size) { throw "文件大小核验失败：$($file.Relative)。未完成的文件保留在 $partial。" }
         $hash = Get-LocalHash $partial
         $target = Join-Path $Destination $file.Relative
@@ -395,6 +473,7 @@ try {
     Write-Event '修复提示的问题后，用相同目标目录重新运行即可续传。Ctrl+C 中断也可重新运行。'
     exit 1
 } finally {
+    if ($mtp) { $mtp.Dispose() }
     if ($script:LogWriter) { $script:LogWriter.Dispose() }
     if ($script:Lock) { $script:Lock.Dispose() }
 }

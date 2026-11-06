@@ -15,7 +15,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("crispy-harmony-photo-import")]
 [assembly: AssemblyProduct("crispy-harmony-photo-import")]
-[assembly: AssemblyDescription("从鸿蒙手机复制照片和视频")]
+[assembly: AssemblyDescription("从安卓和鸿蒙手机复制照片和视频")]
 [assembly: AssemblyVersion("1.0.0.0")]
 
 namespace CrispyHarmonyPhotoImport
@@ -132,15 +132,14 @@ namespace CrispyHarmonyPhotoImport
 
             AddRow(page, MakeLabel("1  连接手机", true));
             AddRow(page, Pair(devices, refresh));
-            AddRow(page, MakeLabel("解锁手机并连接数据线，在手机上打开 USB 调试并允许这台电脑。", false));
-            var help = new LinkLabel { Text = "手机上怎样打开 USB 调试？", AutoSize = true, Margin = new Padding(0, 2, 0, 8) };
+            AddRow(page, MakeLabel("解锁并连接手机。安卓选择 USB 文件传输，鸿蒙开启 USB 调试。", false));
+            var help = new LinkLabel { Text = "手机上怎样设置 USB？", AutoSize = true, Margin = new Padding(0, 2, 0, 8) };
             help.LinkClicked += delegate
             {
                 MessageBox.Show(this,
-                    "1. 在手机设置里搜索“软件版本”，连续点击七次。\n\n" +
-                    "2. 按手机提示开启开发者选项并重启。\n\n" +
-                    "3. 打开设置 → 系统 → 开发者选项 → USB 调试。\n\n" +
-                    "4. 接好数据线，解锁手机，在提示中点“允许”，再回到电脑点“检测手机”。",
+                    "安卓手机接好数据线并解锁，点手机的 USB 通知，选择“文件传输”或“MTP”。如有访问数据的提示，点“允许”。\n\n" +
+                    "鸿蒙手机在设置中搜索“软件版本”，连续点击七次，按提示开启开发者选项。打开设置 → 系统 → 开发者选项 → USB 调试，连接后允许这台电脑。\n\n" +
+                    "设置好后，回到电脑点“检测手机”。",
                     "手机连接帮助", MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
             AddRow(page, help);
@@ -169,12 +168,11 @@ namespace CrispyHarmonyPhotoImport
             browse.Click += delegate { ChooseFolder(); };
             open.Click += delegate { OpenFolder(); };
             details.Click += delegate { ShowLog(); };
-            devices.SelectedIndexChanged += delegate
+            devices.SelectedIndexChanged += async delegate
             {
                 if (updatingDevices || busy) return;
                 albums.Items.Clear();
-                state.Text = "已选择手机，点击“检测手机”读取相册。";
-                RefreshControls();
+                await ReadAlbumsAsync();
             };
             albums.SelectedIndexChanged += delegate { RefreshControls(); };
             destination.TextChanged += delegate { RefreshControls(); };
@@ -299,20 +297,21 @@ namespace CrispyHarmonyPhotoImport
             if (!gotAlbums)
             {
                 var connected = devices.SelectedItem as Phone;
-                if (devices.Items.Count > 1 && connected != null && String.IsNullOrEmpty(requestedDevice))
+                if (devices.Items.Count > 1 && connected == null)
                 {
                     state.Text = "找到多台设备";
-                    hint.Text = "请选择要导入的手机，再点击“检测手机”。";
+                    hint.Text = "请从下拉框选择要导入的手机。";
                 }
                 else if (connected != null && connected.State == "Connected")
                 {
                     state.Text = "手机已连接，但无法读取相册";
-                    hint.Text = "请确认已解锁手机并允许调试，再试一次。具体原因可在“详细信息”中查看。";
+                    hint.Text = connected.Kind == "Mtp" ? "请解锁手机并选择 USB 文件传输，再点“检测手机”。"
+                        : "请确认手机已解锁并允许 USB 调试。具体原因见“详细信息”。";
                 }
                 else
                 {
                     state.Text = connected != null && connected.State == "Unauthorized" ? "请在手机上点“允许”" : "还没有连上手机";
-                    hint.Text = "解锁手机、检查数据线和 USB 调试，再点击“检测手机”。";
+                    hint.Text = "安卓请选择 USB 文件传输，鸿蒙请允许 USB 调试，然后再次检测。";
                 }
                 if (lastError != null && devices.Items.Count == 0 && !gotDevices)
                 {
@@ -322,7 +321,6 @@ namespace CrispyHarmonyPhotoImport
             }
         }
 
-        private string requestedDevice;
         private bool gotDevices;
 
         internal async Task StartImportAsync()
@@ -388,7 +386,6 @@ namespace CrispyHarmonyPhotoImport
             gotDevices = false;
             lastError = null;
             var phone = devices.SelectedItem as Phone;
-            requestedDevice = phone == null ? "" : phone.Id;
             string requestFile = null;
             progress.Style = ProgressBarStyle.Marquee;
             lock (log) log.Clear();
@@ -399,7 +396,8 @@ namespace CrispyHarmonyPhotoImport
                 Directory.CreateDirectory(jobDir);
                 requestFile = Path.Combine(jobDir, Guid.NewGuid().ToString("N") + ".json");
                 pausePath = importing ? requestFile + ".pause" : null;
-                var request = new { action = action, device = requestedDevice, destination = path,
+                var request = new { action = action, device = phone == null ? "" : phone.Id,
+                    deviceKind = phone == null ? "" : phone.Kind, destination = path,
                     album = selected == null ? "相机" : selected.Name, allAlbums = selected != null && selected.All };
                 File.WriteAllText(requestFile, new JavaScriptSerializer().Serialize(request), new UTF8Encoding(false));
                 RefreshControls();
@@ -428,6 +426,7 @@ namespace CrispyHarmonyPhotoImport
             var arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(Path.Combine(payload, "Import-HarmonyPhotos.ps1"))
                 + " -GuiRequest " + Quote(request);
             if (hdcOverride != null) arguments += " -HdcPath " + Quote(hdcOverride);
+            else arguments += " -MtpAssembly " + Quote(Application.ExecutablePath);
             var info = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe"), arguments)
             {
                 UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
@@ -472,14 +471,17 @@ namespace CrispyHarmonyPhotoImport
                     if (importing) break;
                     updatingDevices = true;
                     devices.Items.Clear();
-                    int previous = -1;
+                    int chosen = -1;
+                    var selection = data["selected"] as Dictionary<string, object>;
                     foreach (Dictionary<string, object> item in (System.Collections.IEnumerable)data["items"])
                     {
-                        var phone = new Phone { Id = (string)item["Id"], State = (string)item["State"] };
-                        if (phone.Id == requestedDevice) previous = devices.Items.Count;
+                        var phone = new Phone { Id = (string)item["Id"], Name = (string)item["Name"],
+                            State = (string)item["State"], Kind = (string)item["Kind"] };
+                        if (selection != null && phone.Id == (string)selection["Id"] && phone.Kind == (string)selection["Kind"])
+                            chosen = devices.Items.Count;
                         devices.Items.Add(phone);
                     }
-                    if (devices.Items.Count > 0) devices.SelectedIndex = previous >= 0 ? previous : 0;
+                    devices.SelectedIndex = chosen;
                     updatingDevices = false;
                     break;
                 case "albums":
@@ -488,14 +490,14 @@ namespace CrispyHarmonyPhotoImport
                     int camera = 0, old = -1;
                     foreach (string name in (System.Collections.IEnumerable)data["items"])
                     {
-                        if (name == "相机") camera = albums.Items.Count;
+                        if (name == (string)data["defaultAlbum"]) camera = albums.Items.Count;
                         if (selected != null && !selected.All && selected.Name == name) old = albums.Items.Count;
                         albums.Items.Add(new Album { Name = name });
                     }
                     if (albums.Items.Count == 0)
                     {
                         state.Text = "手机已连接，但没有可见相册";
-                        hint.Text = "确认照片已保存在手机上，再点击“检测手机”。";
+                        hint.Text = "确认照片已保存在手机上，再点击“检测手机”。安卓会查找 DCIM 等常用媒体目录。";
                         break;
                     }
                     albums.Items.Add(new Album { All = true, Name = "全部可见相册" });
@@ -571,10 +573,11 @@ namespace CrispyHarmonyPhotoImport
 
         private sealed class Phone
         {
-            internal string Id, State;
+            internal string Id, Name, State, Kind;
             public override string ToString()
             {
-                return Id + (State == "Connected" ? "（已连接）" : State == "Unauthorized" ? "（等待手机授权）" : "（未就绪）");
+                if (Kind == "Mtp") return "USB 文件传输 · " + Name;
+                return "鸿蒙 · " + Name + (State == "Connected" ? "（已连接）" : State == "Unauthorized" ? "（等待手机授权）" : "（未就绪）");
             }
         }
 
