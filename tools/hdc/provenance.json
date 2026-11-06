@@ -1,0 +1,32 @@
+{
+  "version": "3.2.0b",
+  "sourceRelease": "OpenHarmony 6.0 Release",
+  "sourceReleaseUrl": "https://gitee.com/openharmony/docs/blob/master/zh-cn/release-notes/OpenHarmony-v6.0-release.md",
+  "sourceArchiveUrl": "https://repo.huaweicloud.com/openharmony/os/6.0-Release/ohos-sdk-windows_linux-public.tar.gz",
+  "sourceArchiveSha256": "a315834ac133625efc912bd078f3e2b2550868d04aef1b5aa4f9679c8b3c9d8e",
+  "officialChecksumUrl": "https://repo.huaweicloud.com/openharmony/os/6.0-Release/ohos-sdk-windows_linux-public.tar.gz.sha256",
+  "component": "windows/toolchains-windows-x64-6.0.0.47-Beta1.zip",
+  "componentSha256": "57835bb3b1e235ee5c5c1ff2939a6a685df18ee6774839cc0571e6210f943677",
+  "libusbSource": {
+    "name": "libusb-1.0.28-openharmony-source.zip",
+    "url": "https://codeload.github.com/openharmony/third_party_libusb/zip/371dea6f11f6642bf5847a41a2d334c511835568",
+    "sha256": "c05fe42d4e756731c18e7e10ce78652ff9e1c3ebb6af3cacc63b35e8f1becf86"
+  },
+  "files": [
+    {
+      "name": "hdc.exe",
+      "bytes": 5448704,
+      "sha256": "f6d6c47551d976f33b0f22b17a74f345c0788e59131873aa5f75d356f5141d9b"
+    },
+    {
+      "name": "libusb_shared.dll",
+      "bytes": 202240,
+      "sha256": "77d35ec3e2b3be8201aaab90ea2f8470c6d960be38bd941fc8c26bfcacace73b"
+    },
+    {
+      "name": "NOTICE.txt",
+      "bytes": 751224,
+      "sha256": "b4947de72780af5d592a7f6dd1bef84e730cb06818ffd75dd18222331160b163"
+    }
+  ]
+}

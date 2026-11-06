@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The importer verifies the upstream files byte for byte.
+tools/hdc/NOTICE.txt -text
+tools/hdc/*.exe binary
+tools/hdc/*.dll binary
+tools/hdc/*.zip binary
