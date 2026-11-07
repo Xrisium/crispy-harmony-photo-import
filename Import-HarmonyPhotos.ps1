@@ -5,6 +5,7 @@ param(
     [ValidateSet('Hdc', 'Mtp')][string]$DeviceKind,
     [string[]]$Album = @('相机'),
     [switch]$AllAlbums,
+    [switch]$FullScan,
     [switch]$ListAlbums,
     [switch]$DryRun,
     [switch]$NonInteractive,
@@ -24,6 +25,7 @@ $script:Serial = ''
 $script:PauseFile = ''
 $mtp = $null
 $estimate = $false
+$albumPath = ''
 
 function Write-GuiEvent([string]$Kind, [hashtable]$Data) {
     if ($GuiRequest) {
@@ -155,17 +157,93 @@ function Get-HdcTargets {
     }
 }
 
-function Get-MtpAlbumFiles([string]$Id, [string]$Remote, [string]$Relative) {
-    Test-ImportPause
-    foreach ($entry in $mtp.GetEntries($Id)) {
+function Get-MtpStorages {
+    foreach ($storage in $mtp.GetStorages()) {
+        Assert-SafeName $storage.Name
+        if ($storage.Name -eq '.harmony-import') { throw '存储名称与导入记录目录冲突：.harmony-import' }
+        $storage
+    }
+}
+
+function Get-MtpRoots {
+    foreach ($storage in Get-MtpStorages) {
+        foreach ($entry in $mtp.GetEntries($storage.Id, $false)) {
+            if ($entry.IsFolder -and $entry.Name -in @('DCIM', 'Pictures', 'Movies', 'Download', 'Downloads', 'Screenshots')) {
+                [pscustomobject]@{
+                    Id = $entry.Id; Storage = $storage.Name; Folder = $entry.Name
+                    Name = "$($entry.Name)（$($storage.Name)）"; Remote = '/' + $storage.Name + '/' + $entry.Name; Bytes = $null
+                }
+            }
+        }
+    }
+}
+
+function Get-MtpAlbums([string]$Path, [object[]]$Roots) {
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pending = [Collections.Generic.Stack[object]]::new()
+    $scanned = 0
+    if ($PSBoundParameters.ContainsKey('Roots')) {
+        foreach ($root in $Roots) { $pending.Push(@{ Id = $root.Id; Storage = $root.Storage; Folder = $root.Folder; Remote = $root.Remote }) }
+    } else {
+        foreach ($storage in Get-MtpStorages) {
+            $root = '/' + $storage.Name
+            if (!$Path -or $Path -ceq $root -or $Path.StartsWith($root + '/', [StringComparison]::Ordinal)) {
+                $pending.Push(@{ Id = $storage.Id; Storage = $storage.Name; Folder = ''; Remote = $root })
+            }
+        }
+    }
+    while ($pending.Count) {
+        Test-ImportPause
+        $folder = $pending.Pop()
+        if (!$seen.Add($folder.Id)) { continue }
+        $scanned++
+        if ($scanned % 100 -eq 0) { Write-GuiEvent 'phase' @{ message = "正在扫描手机媒体目录，已检查 $scanned 个文件夹…" } }
+        $includeFiles = !$Path -or $folder.Remote -ceq $Path
+        [long]$bytes = 0
+        $sizeKnown = $true
+        $hasMedia = $false
+        $media = [Collections.Generic.List[object]]::new()
+        foreach ($entry in $mtp.GetEntries($folder.Id, $includeFiles)) {
+            Test-ImportPause
+            if ($entry.IsFolder) {
+                $remote = $folder.Remote + '/' + $entry.Name
+                if (!$Path -or $Path -ceq $remote -or $Path.StartsWith($remote + '/', [StringComparison]::Ordinal)) {
+                    $child = if ($folder.Folder) { $folder.Folder + '/' + $entry.Name } else { $entry.Name }
+                    if ($child -in @('Android/data', 'Android/obb')) { continue }
+                    $pending.Push(@{ Id = $entry.Id; Storage = $folder.Storage; Folder = $child; Remote = $remote })
+                }
+            } elseif ($includeFiles -and $seen.Add($entry.Id)) {
+                $hasMedia = $true
+                if ($null -eq $entry.Size) { $sizeKnown = $false }
+                else { $bytes += $entry.Size }
+                if (!$ListAlbums) { $media.Add($entry) }
+            }
+        }
+        if ($hasMedia) {
+            $display = if ($folder.Folder) { $folder.Folder } else { '/' }
+            [pscustomobject]@{
+                Name = "$display（$($folder.Storage)）"; Storage = $folder.Storage; Folder = $folder.Folder
+                Remote = $folder.Remote; Bytes = if ($sizeKnown) { $bytes } else { $null }; Files = $media
+            }
+        }
+    }
+}
+
+function Get-MtpAlbumFiles($Album) {
+    $relative = $Album.Storage
+    if ($Album.Folder) {
+        foreach ($part in $Album.Folder.Split('/')) {
+            Assert-SafeName $part
+            $relative = Join-Path $relative $part
+        }
+    }
+    foreach ($entry in $Album.Files) {
         Test-ImportPause
         Assert-SafeName $entry.Name
-        $remotePath = $Remote + '/' + $entry.Name
-        $relativePath = Join-Path $Relative $entry.Name
-        if ($entry.IsFolder) {
-            Get-MtpAlbumFiles $entry.Id $remotePath $relativePath
-        } else {
-            [pscustomobject]@{ Remote = $remotePath; Relative = $relativePath; Size = $entry.Size; Modified = $entry.Modified; ObjectId = $entry.Id }
+        if ($null -eq $entry.Size) { throw "手机未提供可核验的文件大小：$($entry.Name)" }
+        [pscustomobject]@{
+            Remote = $Album.Remote + '/' + $entry.Name; Relative = Join-Path $relative $entry.Name
+            Size = $entry.Size; Modified = $entry.Modified; ObjectId = $entry.Id
         }
     }
 }
@@ -242,6 +320,8 @@ try {
         $Destination = $request.destination
         $Album = @($request.album)
         $AllAlbums = $request.allAlbums
+        if ($request.PSObject.Properties['fullScan']) { $FullScan = $request.fullScan }
+        if (!$ListAlbums -and !$AllAlbums -and $request.PSObject.Properties['albumPath']) { $albumPath = $request.albumPath }
         $script:PauseFile = $GuiRequest + '.pause'
     }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitOperatingSystem) {
@@ -259,20 +339,17 @@ try {
         Write-Host "已连接 USB 文件传输设备：$($phone.Name)"
         try {
             $mtp = [CrispyHarmonyPhotoImport.MtpDevice]::new($phone.Id)
-            $albums = @(
-                foreach ($folder in $mtp.GetAlbums()) {
-                    Assert-SafeName $folder.Storage
-                    Assert-SafeName $folder.Folder
-                    if ($folder.Storage -eq '.harmony-import') { throw '存储名称与导入记录目录冲突：.harmony-import' }
-                    [pscustomobject]@{
-                        Id = $folder.Id; Name = "$($folder.Folder)（$($folder.Storage)）"; Camera = $folder.Folder -eq 'DCIM'
-                        Remote = '/' + $folder.Storage + '/' + $folder.Folder
-                        Relative = Join-Path $folder.Storage $folder.Folder
-                    }
-                }
-            )
+            $mtp.IncludeModified = !$ListAlbums -and !$estimate
+            $mtp.RespectNoMedia = $true
+            if ($FullScan) {
+                Write-GuiEvent 'phase' @{ message = '正在完整扫描手机媒体目录…' }
+                $albums = @(Get-MtpAlbums $albumPath | Sort-Object Storage, Folder)
+            } else {
+                $albums = @(Get-MtpRoots | Sort-Object Storage, Folder)
+            }
             if (@($albums | Group-Object Name | Where-Object { $_.Count -gt 1 }).Count) { throw '手机上有重名相册。' }
-        } catch { throw "无法读取 USB 相册。请解锁手机，并在 USB 通知中选择「文件传输」。$_" }
+        } catch [OperationCanceledException] { throw }
+        catch { throw "无法读取 USB 相册。请解锁手机，并在 USB 通知中选择「文件传输」。$_" }
     } else {
         $script:Serial = $phone.Id
         Write-Host "已连接鸿蒙手机：$script:Serial"
@@ -281,11 +358,27 @@ try {
         try { $albums = @(Get-RemoteEntries $mediaRoot | Where-Object { $_.Kind -eq 'd' }) }
         catch { throw "当前系统未提供可读的相册接口，无法用此工具直接导入。请确认 HarmonyOS 6、USB 调试和授权状态。详细信息：$_" }
     }
-    $camera = if ($mtp) { $albums | Where-Object Camera | Select-Object -First 1 }
-        else { $albums | Where-Object { $_.Name -eq '相机' } | Select-Object -First 1 }
+    if ($mtp) {
+        $camera = $albums | Where-Object { $_.Folder -eq 'DCIM/Camera' } | Select-Object -First 1
+        if (!$camera) { $camera = $albums | Where-Object { $_.Folder -match '^DCIM(?:/|$)' } | Select-Object -First 1 }
+    } else {
+        $camera = $albums | Where-Object { $_.Name -eq '相机' } | Select-Object -First 1
+    }
     $defaultAlbum = if ($camera) { $camera.Name } elseif ($albums.Count) { $albums[0].Name } else { $null }
     if ($ListAlbums) {
-        Write-GuiEvent 'albums' @{ defaultAlbum = $defaultAlbum; items = @($albums | ForEach-Object { $_.Name }) }
+        $items = @(
+            foreach ($a in $albums) {
+                $item = @{ name = $a.Name; path = $null; bytes = $null }
+                if ($mtp) { $item.path = $a.Remote; $item.bytes = $a.Bytes }
+                $item
+            }
+        )
+        $allBytes = $null
+        if ($mtp -and !@($albums | Where-Object { $null -eq $_.Bytes }).Count) {
+            $allBytes = [long]0
+            foreach ($a in $albums) { $allBytes += $a.Bytes }
+        }
+        Write-GuiEvent 'albums' @{ defaultAlbum = $defaultAlbum; items = $items; allBytes = $allBytes }
         $albums | ForEach-Object { Write-Host $_.Name }
         exit 0
     }
@@ -318,12 +411,17 @@ try {
         }
         $selected = @($albums | Where-Object { $_.Name -in $Album })
     }
+    $fileAlbums = $selected
+    if ($mtp -and !$FullScan) {
+        Write-GuiEvent 'phase' @{ message = '正在读取所选相册中的照片和视频…' }
+        $fileAlbums = @(Get-MtpAlbums -Path '' -Roots $selected)
+    }
     $files = @(
-        foreach ($a in $selected) {
+        foreach ($a in $fileAlbums) {
             Test-ImportPause
             Write-Host "正在读取相册：$($a.Name)（大型相册可能需要一些时间）"
             Write-GuiEvent 'phase' @{ message = "正在读取相册 $($a.Name)…" }
-            if ($mtp) { Get-MtpAlbumFiles $a.Id $a.Remote $a.Relative }
+            if ($mtp) { Get-MtpAlbumFiles $a }
             else { Get-AlbumFiles $a.Remote $a.Name }
         }
     )
@@ -438,7 +536,7 @@ try {
         Test-ImportPause
         $index = $copied + 1
         $percent = if ($total -gt 0) { [Math]::Floor([decimal]100 * $doneBytes / $total) } else { 0 }
-        Write-Progress -Activity '正在导入照片和视频' -Status "$doneBytes / $total 字节 · $($progress.done) / $($files.Count) 个文件 · $($file.Relative)" -PercentComplete $percent
+        Write-Progress -Activity '正在导入照片和视频' -Status "$doneBytes / $total 字节，$($progress.done) / $($files.Count) 个文件，$($file.Relative)" -PercentComplete $percent
         Write-Event ("[{0}/{1}] {2}" -f $index, $pending.Count, $file.Relative)
         if (Test-Path -LiteralPath $partial) { [IO.File]::Delete($partial) }
         if ($mtp) { $mtp.CopyFile($file.ObjectId, $partial) }

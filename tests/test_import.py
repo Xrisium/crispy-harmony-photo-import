@@ -229,7 +229,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual({item['Kind'] for item in devices['items']}, {'Hdc', 'Mtp'})
         self.assertIsNone(devices['selected'])
         data.update(device='TEST-USB', deviceKind='Mtp')
-        devices, albums = run_gui()
+        devices, albums = (event for event in run_gui() if event['kind'] in ('devices', 'albums'))
         self.assertEqual(devices['selected']['Kind'], 'Mtp')
         self.assertEqual(albums['defaultAlbum'], 'DCIM（内部存储）')
         data['action'] = 'import'
@@ -246,6 +246,67 @@ class ImportTests(unittest.TestCase):
         devices, albums = run_gui(mtp_mode='absent')
         self.assertEqual(devices['selected']['Kind'], 'Hdc')
         self.assertEqual(albums['defaultAlbum'], '相机')
+
+    def test_mtp_nested_albums_count_each_file_once(self):
+        request = dict(action='browse', device='TEST-USB', deviceKind='Mtp',
+                       destination=str(self.dest), album='', allAlbums=False, fullScan=True)
+
+        def run_gui(**kwargs):
+            return self.run_gui(request, '-MtpAssembly', str(self.mtp), mtp_mode='nested', **kwargs)
+
+        listing = next(event for event in run_gui() if event['kind'] == 'albums')
+        self.assertEqual(listing['defaultAlbum'], 'DCIM/Camera（内部存储）')
+        by_name = {item['name']: item for item in listing['items']}
+        self.assertEqual({name: item['bytes'] for name, item in by_name.items()}, {
+            '/（内部存储）': 4, 'Android/media/com.tencent.mm/WeiXin（内部存储）': 4,
+            'DCIM（内部存储）': 4, 'DCIM/Camera（内部存储）': 8, 'DCIM/Screenshots（内部存储）': 4,
+            'Download（内部存储）': 4, 'Pictures/Screenshots（内部存储）': 4, 'Pictures（SD 卡）': 4,
+        })
+        self.assertEqual(listing['allBytes'], 36)
+        parent = by_name['DCIM（内部存储）']
+        request.update(action='estimate', album=parent['name'], albumPath=parent['path'])
+        self.assertEqual(next(e['totalBytes'] for e in run_gui() if e['kind'] == 'albumSize'), 4)
+        request['allAlbums'] = True
+        self.assertEqual(next(e['totalBytes'] for e in run_gui() if e['kind'] == 'albumSize'), 36)
+        self.assertFalse(self.dest.exists())
+        request.update(action='import', allAlbums=False)
+        run_gui()
+        self.assertEqual(self.summary()['totalFiles'], 1)
+        self.assertTrue((self.dest / '内部存储/DCIM/cover.jpg').exists())
+        self.assertFalse((self.dest / '内部存储/DCIM/Camera').exists())
+        request['allAlbums'] = True
+        run_gui(mtp_session='reconnect')
+        summary = self.summary()
+        self.assertEqual((summary['totalFiles'], summary['totalBytes'], summary['copied'], summary['verifiedSkipped']), (9, 36, 8, 1))
+        self.assertTrue((self.dest / '内部存储/Android/media/com.tencent.mm/WeiXin/微信.jpg').exists())
+        self.assertTrue((self.dest / '内部存储/DCIM/Screenshots/screen.png').exists())
+        self.assertTrue((self.dest / '内部存储/Pictures/Screenshots/screen.png').exists())
+        request.update(action='browse', fullScan=False)
+        simple = next(event for event in run_gui() if event['kind'] == 'albums')
+        self.assertEqual(simple['defaultAlbum'], 'DCIM（内部存储）')
+        roots = {item['name']: item for item in simple['items']}
+        self.assertEqual(set(roots), {'DCIM（内部存储）', 'Pictures（内部存储）', 'Pictures（SD 卡）', 'Download（内部存储）', 'Movies（内部存储）'})
+        self.assertTrue(all(item['bytes'] is None for item in roots.values()))
+        self.assertIsNone(simple['allBytes'])
+        camera = roots['DCIM（内部存储）']
+        request.update(action='estimate', allAlbums=False, album=camera['name'], albumPath=camera['path'])
+        self.assertEqual(next(e['totalBytes'] for e in run_gui() if e['kind'] == 'albumSize'), 16)
+        request['allAlbums'] = True
+        self.assertEqual(next(e['totalBytes'] for e in run_gui() if e['kind'] == 'albumSize'), 28)
+        request['action'] = 'import'
+        run_gui()
+        self.assertEqual((self.summary()['totalFiles'], self.summary()['totalBytes'], self.summary()['copied']), (7, 28, 0))
+        self.assertFalse((self.dest / '内部存储/Android/data').exists())
+        self.assertFalse((self.dest / '内部存储/CacheAlbum').exists())
+
+    def test_default_mtp_browse_reads_storage_roots_only(self):
+        request = dict(action='browse', device='TEST-USB', deviceKind='Mtp',
+                       destination=str(self.dest), album='', allAlbums=False)
+        events = self.run_gui(request, '-MtpAssembly', str(self.mtp), mtp_mode='roots-only')
+        listing = next(event for event in events if event['kind'] == 'albums')
+        self.assertEqual({item['name'] for item in listing['items']}, {'DCIM（内部存储）', 'Pictures（SD 卡）'})
+        self.assertIsNone(listing['allBytes'])
+        self.assertFalse(self.dest.exists())
 
 
 if __name__ == '__main__':

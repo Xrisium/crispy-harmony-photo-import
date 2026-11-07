@@ -77,12 +77,47 @@ namespace CrispyHarmonyPhotoImport
         void Add(ref PropertyKey key);
     }
 
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("482b05c0-4056-44ed-9e0f-5e23b009da93")]
+    internal interface IPortableDevicePropertiesBulk
+    {
+        void QueueGetValuesByObjectList(IPortableDevicePropVariantCollection objects, IPortableDeviceKeyCollection keys,
+            IPortableDevicePropertiesBulkCallback callback, out Guid context);
+        void QueueGetValuesByObjectFormat();
+        void QueueSetValuesByObjectList();
+        void Start(ref Guid context);
+        [PreserveSig] int Cancel(ref Guid context);
+    }
+
+    [ComVisible(true), InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("9deacb80-11e8-40e3-a9f3-f557986a7845")]
+    public interface IPortableDevicePropertiesBulkCallback
+    {
+        [PreserveSig] int OnStart(ref Guid context);
+        [PreserveSig] int OnProgress(ref Guid context, IntPtr results);
+        [PreserveSig] int OnEnd(ref Guid context, int status);
+    }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("89b2e422-4f1b-4316-bcef-a44afea83eb3")]
+    internal interface IPortableDevicePropVariantCollection
+    {
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropVariant value);
+        void Add(ref PropVariant value);
+    }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("6e3f2d79-4e07-48c4-8208-d8c2e5af4a99")]
+    internal interface IPortableDeviceValuesCollection
+    {
+        void GetCount(out uint count);
+        void GetAt(uint index, out IPortableDeviceValues values);
+        void Add(IPortableDeviceValues values);
+    }
+
     [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("6848f6f2-3155-4f86-b6f5-263eeeab3143")]
     internal interface IPortableDeviceValues
     {
-        void GetCount();
-        void GetAt();
-        void SetValue();
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropertyKey key, out PropVariant value);
+        void SetValue(ref PropertyKey key, ref PropVariant value);
         [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
         void SetStringValue(ref PropertyKey key, [MarshalAs(UnmanagedType.LPWStr)] string value);
         [PreserveSig] int GetStringValue(ref PropertyKey key, [MarshalAs(UnmanagedType.LPWStr)] out string value);
@@ -114,6 +149,7 @@ namespace CrispyHarmonyPhotoImport
         [FieldOffset(0)] internal ushort Type;
         [FieldOffset(8)] internal long FileTime;
         [FieldOffset(8)] internal double Date;
+        [FieldOffset(8)] internal IntPtr Pointer;
 
         [DllImport("ole32.dll")]
         internal static extern int PropVariantClear(ref PropVariant value);

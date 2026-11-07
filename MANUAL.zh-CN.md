@@ -6,7 +6,7 @@
 
 1. 把 `crispy-harmony-photo-import-win-x64.exe` 放到目标电脑，双击打开。启动时会自动准备内置的导入脚本和 HDC。同名的 `.exe.sha256` 文件仅供下载后核验。
 2. 连接并解锁手机。安卓在 USB 通知里选「文件传输」或「MTP」，有访问提示时点「允许」。鸿蒙通过窗口中的蓝色帮助链接找到开启 USB 调试和授权的步骤。设置好后点「检测手机」。有多台就绪设备时，从下拉框选择目标设备，程序会读取其相册。
-3. 默认优先选择安卓的 `DCIM` 或鸿蒙的「相机」，也可从下拉框选择其他相册或「全部可见相册」。保留默认位置，或点击「选择文件夹」，然后点「开始导入」。
+3. 默认优先选择安卓的 `DCIM` 或鸿蒙的「相机」，也可从下拉框选择其他相册或「全部可见相册」。所选范围的大小在后台估算。保留默认位置，或点击「选择文件夹」，然后点「开始导入」。
 4. 查看进度。若点「暂停」，当前文件处理完成后暂停。再次点击「开始导入」并使用原位置即可继续。程序会记住最近一次尝试导入的保存位置。
 5. 完成后点击「打开保存位置」。连接或导入出错时，窗口显示操作提示，「详细信息」可查看当前操作的诊断内容。
 
@@ -15,7 +15,7 @@ EXE 使用 Windows 自带的 .NET Framework 和 PowerShell。内置文件展开�
 ## 2. 适用范围
 
 - 电脑使用 Windows 10/11 x64。EXE 使用系统自带的 .NET Framework 和 Windows PowerShell 5.1，普通用户可直接启动。
-- 安卓手机需在 USB 设置中开放文件传输。程序使用 Windows Portable Devices（WPD）读取手机公开的存储，选择 `DCIM`、`Pictures`、`Movies`、`Download`、`Downloads` 和 `Screenshots` 等常用目录下的照片和视频。导入目录按「存储名称\媒体目录\子目录」排列，例如 `内部存储\DCIM\Camera`。Windows 识别到的 USB 文件传输设备会显示为「USB 文件传输」。
+- 安卓手机需在 USB 设置中开放文件传输。默认只列出存储根目录中的常用媒体目录，包含 `DCIM`、`Pictures`、`Movies`、`Download`、`Downloads` 和 `Screenshots`。这一步只读取根目录，不预先计算整个相册大小。选中相册后在后台递归估算，导入时递归读取该相册的文件。勾选「完整扫描」会递归查找媒体子目录，分别列出截图、微信等相册，可能需要较长时间。两种模式都跳过含 `.nomedia` 的目录及其子目录，以及 `Android/data`、`Android/obb`。「全部可见相册」及其估算和导入范围与当前模式一致。导入后保留原始目录层级，例如 `内部存储\DCIM\Camera`。Windows 识别到的 USB 文件传输设备会显示为「USB 文件传输」。
 - 鸿蒙手机需开启开发者选项和 USB 调试，并授权电脑。工具面向 HarmonyOS 6，要求 HDC 能访问手机的 `/mnt/data/100/media_fuse/Photo`。程序按该接口提供的相册目录导入。同一部手机如果同时开放两种接口，可能显示两个条目，鸿蒙可选择标有「鸿蒙」的条目。
 - 两种方式都保留文件名、目录层级和文件内容。文件内的 EXIF 等元数据随文件一起复制。电脑端的文件系统修改时间可能与手机不同。
 - 导入范围由媒体接口实际列出且可读取的文件决定。云端独有的原件可先在手机下载后再导入。隐藏相册、回收站和动态照片的附加数据是否可见，取决于手机提供的接口。工具按文件复制，不解析相册数据库或媒体格式。
@@ -46,7 +46,7 @@ EXE 使用 Windows 自带的 .NET Framework 和 PowerShell。内置文件展开�
 ### 4.2 枚举相册并建立文件计划
 
 1. 鸿蒙通过 HDC 在手机上运行 `ls -ln`，读取媒体根目录 `/mnt/data/100/media_fuse/Photo`，以其中的目录项作为相册。递归遍历时，无法解析的行或符号链接会使导入停止。
-2. 安卓通过只读 WPD 会话枚举存储和媒体目录，按 WPD 内容类型或常见扩展名筛选照片及视频。两种方式都将相册列表送回窗口，为选定的文件记录手机路径、保存相对路径、字节数和修改时间。WPD 对象 ID 只用于当次会话的传输，续传以存储名和文件路径查找既有记录。
+2. 安卓通过只读 WPD 会话枚举存储和媒体目录，按 WPD 内容类型或常见扩展名筛选照片及视频。扫描先读取名称和类型，只为媒体查询大小，正式导入时才读取修改时间。支持批量属性读取的设备会分批查询，缺失结果会逐项补读。默认模式在选定的顶层目录下递归取文件，完整扫描模式将媒体子目录单列，每个条目只取直属文件。估算和导入都按当次 WPD 对象 ID 去重。两种方式都将相册列表送回窗口，为选定的文件记录手机路径、保存相对路径、字节数和修改时间。续传以存储名和文件路径查找既有记录。
 3. `Assert-SafeName` 检查 Windows 文件名中的非法字符、控制字符、末尾空格或点，以及 `CON`、`NUL` 等保留名。相册名 `.harmony-import` 为工具的记录目录保留。预检也检查大小写不敏感的目标路径冲突。
 4. 将所选文件大小求和，确定目标目录，再执行本地预检。
 
@@ -125,5 +125,6 @@ EXE 使用 Windows 自带的 .NET Framework 和 PowerShell。内置文件展开�
   ```
 
 - [离线集成测试](tests/test_import.py) 使用 [模拟 HDC](tests/fake-hdc.ps1) 和 [模拟 USB 文件传输设备](tests/fake-mtp.cs)，覆盖混合设备选择、相册选择、中文与空格路径、设备状态、续传、断线、同名保护、传输大小异常和损坏记录恢复等流程。开发机可用 `python -m unittest discover -s tests -v` 运行。
-- 维护媒体目录探测或 HDC 参数时，可查阅上游接口说明。[HDC 命令文档](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/dfx/hdc.md) · [媒体导出接口文档](https://gitee.com/openharmony/docs/blob/master/zh-cn/application-dev/tools/mediatool.md)
-- 安卓连接方式与 WPD 实现可查阅官方文档。[安卓 USB 文件传输](https://support.google.com/android/answer/9064445?hl=en-GB) · [Windows 便携设备接口](https://learn.microsoft.com/en-us/windows/win32/wpd_sdk/client-interfaces)
+- 维护媒体目录探测或 HDC 参数时，可查阅上游接口说明。[HDC 命令文档](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/dfx/hdc.md)，[媒体导出接口文档](https://gitee.com/openharmony/docs/blob/master/zh-cn/application-dev/tools/mediatool.md)
+- 安卓连接方式与 WPD 实现可查阅官方文档。[安卓 USB 文件传输](https://support.google.com/android/answer/9064445?hl=en-GB)，[Windows 便携设备接口](https://learn.microsoft.com/en-us/windows/win32/wpd_sdk/client-interfaces)
+- WPD 属性批量读取运行在 MTA 线程中，回调按对象 ID 合并分片结果。接口不受支持时回退到逐项查询。[WPD 批量读取说明](https://learn.microsoft.com/en-us/windows/win32/wpd_sdk/retrieving-properties-for-multiple-objects)

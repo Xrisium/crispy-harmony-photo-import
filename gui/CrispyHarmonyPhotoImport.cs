@@ -94,6 +94,8 @@ namespace CrispyHarmonyPhotoImport
         private readonly string hdcOverride;
         private readonly ComboBox devices = Choice("手机");
         private readonly ComboBox albums = Choice("相册");
+        private readonly CheckBox fullScan = new CheckBox { Text = "完整扫描（逐个查找媒体子目录，耗时较长）", AutoSize = true,
+            AccessibleName = "完整扫描安卓相册", Margin = new Padding(0, 3, 0, 3) };
         private readonly TextBox destination = new TextBox { Dock = DockStyle.Fill, AccessibleName = "照片保存位置" };
         private readonly Button refresh = MakeButton("检测手机", 114);
         private readonly Button browse = MakeButton("选择文件夹", 114);
@@ -147,6 +149,7 @@ namespace CrispyHarmonyPhotoImport
             };
             AddRow(page, help);
             AddRow(page, MakeLabel("2  选择相册和保存位置", true));
+            AddRow(page, fullScan);
             AddRow(page, Pair(albums, albumSize));
             AddRow(page, Pair(destination, browse));
             AddRow(page, state);
@@ -178,6 +181,7 @@ namespace CrispyHarmonyPhotoImport
                 await ReadAlbumsAsync();
             };
             albums.SelectedIndexChanged += delegate { UpdateAlbumSize(); RefreshControls(); };
+            fullScan.CheckedChanged += async delegate { if (!busy) await ReadAlbumsAsync(); };
             destination.TextChanged += delegate { RefreshControls(); };
             FormClosing += OnClosing;
             RefreshControls();
@@ -246,6 +250,9 @@ namespace CrispyHarmonyPhotoImport
             refresh.Enabled = !busy;
             devices.Enabled = !busy && devices.Items.Count > 0;
             albums.Enabled = !busy && albums.Items.Count > 0;
+            var phone = devices.SelectedItem as Phone;
+            fullScan.Visible = phone != null && phone.Kind == "Mtp";
+            fullScan.Enabled = !busy;
             destination.Enabled = browse.Enabled = !busy;
             start.Enabled = !busy && albums.SelectedItem != null && !String.IsNullOrWhiteSpace(destination.Text);
             pause.Enabled = busy && importing && pausePath != null;
@@ -337,7 +344,7 @@ namespace CrispyHarmonyPhotoImport
             albumSize.Text = "正在估算…";
             if (busy || closeWhenDone) return;
             estimateCancellation = new CancellationTokenSource();
-            estimateTask = EstimateAsync(estimateTask, phone, album, estimateCancellation);
+            estimateTask = EstimateAsync(estimateTask, phone, album, estimateCancellation, fullScan.Checked);
         }
 
         private void CancelEstimate()
@@ -345,13 +352,13 @@ namespace CrispyHarmonyPhotoImport
             if (estimateCancellation != null) estimateCancellation.Cancel();
         }
 
-        private async Task EstimateAsync(Task previous, Phone phone, Album album, CancellationTokenSource cancellation)
+        private async Task EstimateAsync(Task previous, Phone phone, Album album, CancellationTokenSource cancellation, bool scanAll)
         {
             try
             {
                 await previous;
                 cancellation.Token.ThrowIfCancellationRequested();
-                var bytes = await Task.Run(() => ReadAlbumSize(phone, album, cancellation.Token));
+                var bytes = await Task.Run(() => ReadAlbumSize(phone, album, cancellation.Token, scanAll));
                 if (!cancellation.IsCancellationRequested) ShowAlbumSize(album, bytes);
             }
             catch (Exception error)
@@ -369,9 +376,9 @@ namespace CrispyHarmonyPhotoImport
             }
         }
 
-        private long ReadAlbumSize(Phone phone, Album album, CancellationToken cancellation)
+        private long ReadAlbumSize(Phone phone, Album album, CancellationToken cancellation, bool scanAll)
         {
-            string request = CreateRequest("estimate", phone, album, "");
+            string request = CreateRequest("estimate", phone, album, "", scanAll);
             try
             {
                 long? bytes = null;
@@ -486,7 +493,7 @@ namespace CrispyHarmonyPhotoImport
                 await estimateTask;
                 if (closeWhenDone) return;
                 lock (log) log.Clear();
-                requestFile = CreateRequest(action, phone, selected, path);
+                requestFile = CreateRequest(action, phone, selected, path, fullScan.Checked);
                 pausePath = importing ? requestFile + ".pause" : null;
                 RefreshControls();
                 int code = await Task.Run(() => RunBackend(requestFile,
@@ -510,14 +517,15 @@ namespace CrispyHarmonyPhotoImport
             }
         }
 
-        private string CreateRequest(string action, Phone phone, Album selected, string path)
+        private string CreateRequest(string action, Phone phone, Album selected, string path, bool scanAll)
         {
             var jobDir = Path.Combine(appData, "jobs");
             Directory.CreateDirectory(jobDir);
             var requestFile = Path.Combine(jobDir, Guid.NewGuid().ToString("N") + ".json");
             var request = new { action = action, device = phone == null ? "" : phone.Id,
                 deviceKind = phone == null ? "" : phone.Kind, destination = path,
-                album = selected == null ? "相机" : selected.Name, allAlbums = selected != null && selected.All };
+                album = selected == null ? "相机" : selected.Name, albumPath = selected == null ? null : selected.Path,
+                allAlbums = selected != null && selected.All, fullScan = scanAll };
             try { File.WriteAllText(requestFile, new JavaScriptSerializer().Serialize(request), new UTF8Encoding(false)); }
             catch { TryDelete(requestFile); throw; }
             return requestFile;
@@ -526,7 +534,7 @@ namespace CrispyHarmonyPhotoImport
         private int RunBackend(string request, Action<Dictionary<string, object>> onEvent, Action<string> onLog,
             CancellationToken cancellation)
         {
-            var arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(Path.Combine(payload, "Import-HarmonyPhotos.ps1"))
+            var arguments = "-NoLogo -NoProfile -Mta -NonInteractive -ExecutionPolicy Bypass -File " + Quote(Path.Combine(payload, "Import-HarmonyPhotos.ps1"))
                 + " -GuiRequest " + Quote(request);
             if (hdcOverride != null) arguments += " -HdcPath " + Quote(hdcOverride);
             else arguments += " -MtpAssembly " + Quote(Application.ExecutablePath);
@@ -599,25 +607,26 @@ namespace CrispyHarmonyPhotoImport
                     gotAlbums = true;
                     albums.Items.Clear();
                     int camera = 0, old = -1;
-                    foreach (string name in (System.Collections.IEnumerable)data["items"])
+                    foreach (Dictionary<string, object> item in (System.Collections.IEnumerable)data["items"])
                     {
+                        var name = (string)item["name"];
                         if (name == (string)data["defaultAlbum"]) camera = albums.Items.Count;
                         if (selected != null && !selected.All && selected.Name == name) old = albums.Items.Count;
-                        albums.Items.Add(new Album { Name = name });
+                        albums.Items.Add(new Album { Name = name, Path = (string)item["path"], Size = OptionalSize(item["bytes"]) });
                     }
                     if (albums.Items.Count == 0)
                     {
                         state.Text = "手机已连接，但没有可见相册";
-                        hint.Text = "确认照片已保存在手机上，再点击“检测手机”。安卓会查找 DCIM 等常用媒体目录。";
+                        hint.Text = "确认照片已保存在手机上，并能通过 USB 访问，再点击“检测手机”。";
                         break;
                     }
-                    albums.Items.Add(new Album { All = true, Name = "全部可见相册" });
+                    albums.Items.Add(new Album { All = true, Name = "全部可见相册", Size = OptionalSize(data["allBytes"]) });
                     albums.SelectedIndex = selected != null && selected.All ? albums.Items.Count - 1 : old >= 0 ? old : camera;
                     state.Text = "手机已连接，可以开始导入";
                     hint.Text = "确认相册和保存位置，然后点击“开始导入”。";
                     break;
                 case "phase":
-                    if (pause.Enabled) state.Text = (string)data["message"];
+                    if (!importing || pause.Enabled) state.Text = (string)data["message"];
                     break;
                 case "albumSize":
                     ShowAlbumSize(selected, Convert.ToInt64(data["totalBytes"]));
@@ -627,7 +636,7 @@ namespace CrispyHarmonyPhotoImport
                     var total = Convert.ToInt32(data["total"]);
                     var doneBytes = Convert.ToInt64(data["doneBytes"]);
                     var totalBytes = Convert.ToInt64(data["totalBytes"]);
-                    progressText = String.Format("{0} / {1} · {2} / {3} 个文件", FormatSize(doneBytes), FormatSize(totalBytes), done, total);
+                    progressText = String.Format("{0} / {1}，{2} / {3} 个文件", FormatSize(doneBytes), FormatSize(totalBytes), done, total);
                     progress.Style = ProgressBarStyle.Blocks;
                     progress.Value = totalBytes > 0 ? (int)(100m * doneBytes / totalBytes) : 0;
                     ShowProgress(pause.Enabled ? "正在导入" : "正在暂停…");
@@ -646,9 +655,14 @@ namespace CrispyHarmonyPhotoImport
             }
         }
 
+        private static long? OptionalSize(object value)
+        {
+            return value == null ? (long?)null : Convert.ToInt64(value);
+        }
+
         private void ShowProgress(string status)
         {
-            state.Text = progressText == null ? status : status + " · " + progressText;
+            state.Text = progressText == null ? status : status + "，" + progressText;
         }
 
         private void RequestPause()
@@ -708,14 +722,14 @@ namespace CrispyHarmonyPhotoImport
             internal string Id, Name, State, Kind;
             public override string ToString()
             {
-                if (Kind == "Mtp") return "USB 文件传输 · " + Name;
-                return "鸿蒙 · " + Name + (State == "Connected" ? "（已连接）" : State == "Unauthorized" ? "（等待手机授权）" : "（未就绪）");
+                if (Kind == "Mtp") return "USB 文件传输，" + Name;
+                return "鸿蒙，" + Name + (State == "Connected" ? "（已连接）" : State == "Unauthorized" ? "（等待手机授权）" : "（未就绪）");
             }
         }
 
         private sealed class Album
         {
-            internal string Name;
+            internal string Name, Path;
             internal bool All;
             internal long? Size;
             public override string ToString() { return Name; }
